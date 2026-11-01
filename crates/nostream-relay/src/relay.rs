@@ -531,9 +531,18 @@ impl Relay {
             // Read at the top of every iteration, so a flag the producers set while the loop
             // was parked on a write is acted on as soon as that write returns. No `await`
             // sits between a write completing and this check.
-            if let Some(refusal) = sink.refusal() {
-                self.close_refused(&mut transport, peer, refusal).await;
-                break;
+            match sink.refusal() {
+                Refusal::Clear => {}
+                Refusal::QueueFull => {
+                    self.close_refused(&mut transport, peer, Refusal::QueueFull)
+                        .await;
+                    break;
+                }
+                Refusal::BudgetExhausted => {
+                    self.close_refused(&mut transport, peer, Refusal::BudgetExhausted)
+                        .await;
+                    break;
+                }
             }
 
             tokio::select! {
@@ -653,6 +662,7 @@ impl Relay {
         refusal: Refusal,
     ) {
         match refusal {
+            Refusal::Clear => {}
             Refusal::QueueFull => {
                 tracing::debug!(%peer, "closing a client that cannot keep up with its frame queue");
 

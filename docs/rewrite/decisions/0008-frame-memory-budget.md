@@ -9,7 +9,7 @@
 The outbound frame queue was bounded per socket and nothing bounded their sum.
 `RelayConfig::frame_queue_bytes` (8 MiB; `crates/nostream-relay/src/relay.rs:58`) is enforced by
 `FrameSink::send`'s compare-and-exchange on the socket's own counter
-(`crates/nostream-relay/src/sink.rs:260-334`), and `Relay::serve` accepted every connection with
+(`crates/nostream-relay/src/sink.rs:264-342`), and `Relay::serve` accepted every connection with
 no count at all. The only per-address bookkeeping was the **attempt** limiter, which throttles how
 fast connections open, not how many are held (`crates/nostream-relay/src/limits.rs`, windows
 consumed at `crates/nostream-relay/src/relay.rs:479`).
@@ -54,7 +54,7 @@ refused for it. Neither number is a total-memory ceiling; see the next section.
 ## What "frame memory" means here
 
 Accounted **outbound payload bytes**: the `text.len()` that `frame_queue_bytes` already counts
-(`crates/nostream-relay/src/sink.rs:269-270`), not `String` capacity, not the channel node, and not
+(`crates/nostream-relay/src/sink.rs:274-275`), not `String` capacity, not the channel node, and not
 resident memory. The nearest measurement of the ratio is job 010's probe D, which saw roughly 2 KiB
 resident per 1 KiB queued at 1 KiB frames, so **256 MiB accounted is not a process RSS ceiling** and
 should not be read as one.
@@ -144,7 +144,7 @@ they say something: a close frame with **code `1013`** and a fixed reason string
 them **from each other** is the reason string and the counter, not the code — plus the log line's
 fields (`budget_bytes`/`accounted_bytes` against `peer`/`max_connections_per_ip`/`live`) and, for a
 test driving the relay directly, the accessor (`FrameBudget::refusals` at
-`crates/nostream-relay/src/sink.rs:91` or `ConnectionCap::refusals` at
+`crates/nostream-relay/src/sink.rs:93` or `ConnectionCap::refusals` at
 `crates/nostream-relay/src/connection_cap.rs:60`). Both bounds use `CloseCode::Again`, so `1013` on
 its own tells a client that it was refused and says nothing about which bound did it; anything that
 wants to tell the two apart reads the reason string. That is what keeps both out of the "looks like
@@ -161,17 +161,17 @@ choice, and the unit test that proves room lets the next frame through
 **The refusal stops the reader too, and the abort eventually retires it.** The connection loop
 closes the socket at its next iteration, but a stored read is a task of its own and keeps producing
 events until it notices: `fetch_and_send` encodes one frame per event
-(`crates/nostream-relay/src/handlers/subscribe.rs:326-331`), so a frame that does not fit has been
+(`crates/nostream-relay/src/handlers/subscribe.rs:329-334`), so a frame that does not fit has been
 encoded by the time the sink refuses it. The window is not short — the loop can be parked in a write
 and then in `close_frame`, each bounded only by the 30 s `write_timeout`, and `handlers.abort_all()`
 runs only after both — and it is the normal case, because the budget binds exactly when queues are
 full and loops are parked in writes. So the read checks `context.sink.refusal()` at the top of its
 loop, before pulling or encoding the next record
-(`crates/nostream-relay/src/handlers/subscribe.rs:285-289`), and sends nothing more: no further
+(`crates/nostream-relay/src/handlers/subscribe.rs:285-292`), and sends nothing more: no further
 event, and no `EOSE`, which would be a frame this client is not reading. That leaves the frame that
 was refused as the only one encoded and thrown away per read — one, not one per event — and a socket
 the queue bound has already latched does not even pay that, because `send` returns before `to_text()`
-(`crates/nostream-relay/src/sink.rs:260-266`).
+(`crates/nostream-relay/src/sink.rs:264-272`).
 
 The read does not finish there: it waits on the read's cancellation watch and then calls `end_read`.
 **On the refusal path that wait is never resolved.** Every exit of the connection loop is a `break`,
@@ -209,7 +209,7 @@ times out at two seconds without the signal and closes in about 1.3 s with it.
 
 The budget is enforced where the per-socket bound already is: in `FrameSink::send`, as a second
 compare-and-exchange loop against `accounted + length > limit`
-(`crates/nostream-relay/src/sink.rs:100-136`). Admission requires room in both bounds; the budget has
+(`crates/nostream-relay/src/sink.rs:102-138`). Admission requires room in both bounds; the budget has
 **no empty-queue exception** — unlike `frame_queue_bytes`, whose exception keeps one large event from
 closing every client — because 256 MiB exceeds any single outbound frame the protocol can produce by
 three orders of magnitude, and strictness is what makes a one-byte test budget meaningful.
@@ -237,9 +237,9 @@ of it, not as a defect.
 ## The refund, and the shape rejected
 
 **Chosen: refund on the last handle's `Drop`.** `FrameSink` holds an `Arc<Account>`
-(`crates/nostream-relay/src/sink.rs:201-207`); the account carries the socket's outstanding bytes,
+(`crates/nostream-relay/src/sink.rs:205-211`); the account carries the socket's outstanding bytes,
 its refusal cause and the shared budget, and `impl Drop for Account`
-(`crates/nostream-relay/src/sink.rs:191-197`) returns whatever is left of that socket's bytes to the
+(`crates/nostream-relay/src/sink.rs:195-201`) returns whatever is left of that socket's bytes to the
 budget. Every clone of the socket's sink shares the account, so the drop that runs is the last one: a
 send holds a sink and therefore cannot be in flight or begin once that drop starts. That is what makes
 the refund **exactly this socket's bytes, once**, whatever the connection loop did on the way out.
@@ -327,7 +327,7 @@ Two accessors in the `hidden_content()` style, `Relay::frame_budget()` and
 them: `accounted()`, `limit()`, `refusals()` on the budget; `live(ip)`, `max_per_ip()`,
 `refusals()`, `tracked_addresses()` on the cap. Plus two structured log lines, one per refusal — a
 `warn!` carrying `budget_bytes` and `accounted_bytes` from the sink
-(`crates/nostream-relay/src/sink.rs:321-325`), and a `debug!` carrying `peer`,
+(`crates/nostream-relay/src/sink.rs:327-331`), and a `debug!` carrying `peer`,
 `max_connections_per_ip` and `live` from the connection task
 (`crates/nostream-relay/src/relay.rs:452-457`).
 
@@ -442,7 +442,7 @@ constructor.
    record's original one.
 2. **It would be a fourth meaning for the same numeral.** The repository already has two, and
    they are both in the code, each with its own idiom: *disabled* —
-   "    if max_subscriptions > 0" (`crates/nostream-relay/src/handlers/subscribe.rs:376`),
+   "    if max_subscriptions > 0" (`crates/nostream-relay/src/handlers/subscribe.rs:379`),
    which is what `CONFIGURATION.md` documents for the `limits.client.subscription` family — and
    *invalid*, which is what the adaptive-pow numbers do with it. *Use the default* is a third
    disposition, and the default read is a fourth idiom, belonging to a setting where absence and
@@ -476,9 +476,9 @@ stops the document from reaching the constructor.
 bare upper-bound check cannot be the only one, and a budget of `usize::MAX` stops bounding
 anything: the fit guard subtracts with
 `            if bytes > self.limit_bytes.saturating_sub(accounted) {`
-(`crates/nostream-relay/src/sink.rs:107`), which can never be true against a limit of
+(`crates/nostream-relay/src/sink.rs:109`), which can never be true against a limit of
 `usize::MAX`, while the accounting that follows adds unchecked —
-"                accounted + bytes," (`crates/nostream-relay/src/sink.rs:113`) — so it panics in a
+"                accounted + bytes," (`crates/nostream-relay/src/sink.rs:115`) — so it panics in a
 debug build and wraps in a release one, and a wrapped counter refills the budget it was meant to
 exhaust. The ceiling is what keeps an operator's number out of that arithmetic:
 "pub const MAX_SETTING_BOUND: usize = 1024 * 1024 * 1024 * 1024;"

@@ -44,6 +44,8 @@ use nostream_core::messages::RelayMessage;
 /// Why a frame was refused: the bound that could not hold it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
+    /// No refusal recorded for this socket.
+    Clear,
     /// The frame did not fit this socket's `frame_queue_bytes`.
     QueueFull,
     /// The frame did not fit the relay's `frame_memory_budget_bytes`.
@@ -160,17 +162,19 @@ struct Account {
 
 impl Account {
     /// The refusal recorded for this socket, if a sender has been refused.
-    fn refusal(&self) -> Option<Refusal> {
+    fn refusal(&self) -> Refusal {
         match self.refusal.load(Ordering::SeqCst) {
-            QUEUE_FULL => Some(Refusal::QueueFull),
-            BUDGET_EXHAUSTED => Some(Refusal::BudgetExhausted),
-            _ => None,
+            NO_REFUSAL => Refusal::Clear,
+            QUEUE_FULL => Refusal::QueueFull,
+            BUDGET_EXHAUSTED => Refusal::BudgetExhausted,
+            other => unreachable!("unknown refusal code: {other}"),
         }
     }
 
     /// Records the first refusal for this socket, reporting whether this sender set it.
     fn refuse(&self, refusal: Refusal) -> bool {
         let cause = match refusal {
+            Refusal::Clear => unreachable!("cannot record a Clear refusal"),
             Refusal::QueueFull => QUEUE_FULL,
             Refusal::BudgetExhausted => BUDGET_EXHAUSTED,
         };
@@ -262,8 +266,9 @@ impl FrameSink {
             return;
         };
 
-        if self.account.refusal() == Some(Refusal::QueueFull) {
-            return;
+        match self.account.refusal() {
+            Refusal::QueueFull => return,
+            Refusal::Clear | Refusal::BudgetExhausted => {}
         }
 
         let text = message.to_text();
@@ -274,8 +279,9 @@ impl FrameSink {
         // in its own task and several readers share this sink, so two sends that interleaved
         // a load and a store would lose one increment and admit more than the bound.
         loop {
-            if self.account.refusal() == Some(Refusal::QueueFull) {
-                return;
+            match self.account.refusal() {
+                Refusal::QueueFull => return,
+                Refusal::Clear | Refusal::BudgetExhausted => {}
             }
 
             // An empty queue admits its frame whatever the size, so an event larger than the
@@ -350,7 +356,7 @@ impl FrameSink {
 
     /// Why a frame was refused, if the connection is over its bound. The connection task
     /// closes the client once this is set.
-    pub fn refusal(&self) -> Option<Refusal> {
+    pub fn refusal(&self) -> Refusal {
         self.account.refusal()
     }
 
@@ -390,7 +396,7 @@ mod tests {
         sink.send(&frame);
         sink.send(&frame);
 
-        assert_eq!(sink.refusal(), None);
+        assert_eq!(sink.refusal(), Refusal::Clear);
         assert_eq!(sink.queued_bytes(), 2 * len);
         assert!(frames.try_recv().is_ok());
         assert!(frames.try_recv().is_ok());
@@ -398,7 +404,7 @@ mod tests {
 
         sink.send(&frame);
 
-        assert_eq!(sink.refusal(), Some(Refusal::QueueFull));
+        assert_eq!(sink.refusal(), Refusal::QueueFull);
         assert_eq!(
             sink.queued_bytes(),
             2 * len,
@@ -412,7 +418,7 @@ mod tests {
         // Once the flag is set every later send is dropped as well.
         sink.send(&frame);
 
-        assert_eq!(sink.refusal(), Some(Refusal::QueueFull));
+        assert_eq!(sink.refusal(), Refusal::QueueFull);
         assert_eq!(sink.queued_bytes(), 2 * len);
 
         // A frame larger than the bound still goes out while the queue is empty, so one
@@ -421,13 +427,13 @@ mod tests {
 
         sink.send(&frame);
 
-        assert_eq!(sink.refusal(), None);
+        assert_eq!(sink.refusal(), Refusal::Clear);
         assert_eq!(sink.queued_bytes(), len);
         assert!(frames.try_recv().is_ok());
 
         sink.send(&frame);
 
-        assert_eq!(sink.refusal(), Some(Refusal::QueueFull));
+        assert_eq!(sink.refusal(), Refusal::QueueFull);
         assert_eq!(sink.queued_bytes(), len);
         assert!(frames.try_recv().is_err());
 
@@ -453,7 +459,7 @@ mod tests {
             }
         });
 
-        assert_eq!(sink.refusal(), None, "every frame fits the bound");
+        assert_eq!(sink.refusal(), Refusal::Clear, "every frame fits the bound");
         assert_eq!(sink.queued_bytes(), SENDERS * len);
 
         for _ in 0..SENDERS {
@@ -471,7 +477,7 @@ mod tests {
         sink.release(2 * len);
 
         assert_eq!(sink.queued_bytes(), 0);
-        assert_eq!(sink.refusal(), None);
+        assert_eq!(sink.refusal(), Refusal::Clear);
 
         sink.send(&frame);
         sink.send(&frame);
@@ -503,7 +509,7 @@ mod tests {
 
         third.send(&frame);
 
-        assert_eq!(third.refusal(), Some(Refusal::BudgetExhausted));
+        assert_eq!(third.refusal(), Refusal::BudgetExhausted);
         assert_eq!(
             third.queued_bytes(),
             0,
@@ -571,7 +577,7 @@ mod tests {
 
         third.send(&frame);
 
-        assert_eq!(third.refusal(), None);
+        assert_eq!(third.refusal(), Refusal::Clear);
         assert_eq!(budget.accounted(), len);
         assert!(third_frames.try_recv().is_ok());
     }
@@ -645,4 +651,25 @@ mod tests {
 
         assert_eq!(budget.accounted(), 0);
     }
+
+    #[test]
+    fn refusal_codes_round_trip_through_atomic() {
+        let (sink, _frames) = FrameSink::channel(100, None);
+        assert_eq!(sink.refusal(), Refusal::Clear);
+
+        sink.account.refusal.store(QUEUE_FULL, Ordering::SeqCst);
+        assert_eq!(sink.refusal(), Refusal::QueueFull);
+
+        sink.account.refusal.store(BUDGET_EXHAUSTED, Ordering::SeqCst);
+        assert_eq!(sink.refusal(), Refusal::BudgetExhausted);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown refusal code: 99")]
+    fn unknown_refusal_code_panics_instead_of_swallowing() {
+        let (sink, _frames) = FrameSink::channel(100, None);
+        sink.account.refusal.store(99, Ordering::SeqCst);
+        let _ = sink.refusal();
+    }
 }
+
